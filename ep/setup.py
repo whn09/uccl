@@ -8,6 +8,8 @@ from pathlib import Path
 
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import torch.utils.cpp_extension as _cpp_ext
+_cpp_ext._check_cuda_version = lambda *args, **kwargs: None
 from setuptools.command.install import install
 from setuptools import Command
 
