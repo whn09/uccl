@@ -1173,6 +1173,8 @@ class Buffer {
   std::optional<EventHandle> internode_combine(
       std::uintptr_t x_ptr, int num_tokens, int hidden, int x_dtype_code,
       int x_element_size, std::uintptr_t topk_weights_ptr, int num_topk,
+      std::uintptr_t topk_idx_ptr, std::uintptr_t origin_topk_weights_ptr,
+      std::uintptr_t origin_x_ptr,
       std::uintptr_t bias_0_ptr, std::uintptr_t bias_1_ptr,
       std::uintptr_t src_meta_ptr, int num_combined_tokens,
       std::uintptr_t is_combined_token_in_rank_ptr,
@@ -1239,6 +1241,12 @@ class Buffer {
         topk_weights_ptr == 0
             ? nullptr
             : reinterpret_cast<float const*>(topk_weights_ptr),
+        topk_idx_ptr == 0 ? nullptr
+                          : reinterpret_cast<int64_t const*>(topk_idx_ptr),
+        origin_topk_weights_ptr == 0
+            ? nullptr
+            : reinterpret_cast<float const*>(origin_topk_weights_ptr),
+        origin_x_ptr == 0 ? nullptr : reinterpret_cast<void*>(origin_x_ptr),
         bias_ptrs[0], bias_ptrs[1],
         reinterpret_cast<int const*>(combined_rdma_head_ptr),
         reinterpret_cast<int const*>(combined_nvl_head_ptr),
@@ -1409,7 +1417,8 @@ class Buffer {
   low_latency_combine(
       std::uintptr_t x_ptr, int x_dim0, int x_dim1, int x_dim2,
       std::uintptr_t topk_idx_ptr, int topk_rows, int topk_cols,
-      std::uintptr_t topk_weights_ptr, std::uintptr_t src_info_ptr,
+      std::uintptr_t topk_weights_ptr, std::uintptr_t origin_x_ptr,
+      std::uintptr_t src_info_ptr,
       int src_info_dim0, int src_info_dim1, std::uintptr_t layout_range_ptr,
       int layout_range_dim0, int layout_range_dim1,
       std::uintptr_t combine_wait_recv_cost_stats_ptr,
@@ -1473,6 +1482,8 @@ class Buffer {
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
 
     void* x = reinterpret_cast<void*>(x_ptr);
+    void* origin_x =
+        origin_x_ptr == 0 ? nullptr : reinterpret_cast<void*>(origin_x_ptr);
     int64_t* topk_idx = reinterpret_cast<int64_t*>(topk_idx_ptr);
     float* topk_weights = reinterpret_cast<float*>(topk_weights_ptr);
     int* src_info = reinterpret_cast<int*>(src_info_ptr);
@@ -1486,7 +1497,7 @@ class Buffer {
     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
       uccl::internode_ll::combine(
-          out, buffer.combine_rdma_recv_data_buffer,
+          out, origin_x, buffer.combine_rdma_recv_data_buffer,
           buffer.combine_rdma_recv_flag_buffer, buffer.combine_rdma_send_buffer,
           x, topk_idx, topk_weights, src_info, layout_range,
           combine_wait_recv_cost_stats, ptr0, ptr_internode0, count0,
@@ -2285,6 +2296,9 @@ NB_MODULE(ep, m) {
           [](Buffer& self, std::uintptr_t x_ptr, int num_tokens, int hidden,
              int x_dtype_code, int x_element_size,
              std::uintptr_t topk_weights_ptr, int num_topk,
+             std::uintptr_t topk_idx_ptr,
+             std::uintptr_t origin_topk_weights_ptr,
+             std::uintptr_t origin_x_ptr,
              std::uintptr_t bias_0_ptr, std::uintptr_t bias_1_ptr,
              std::uintptr_t src_meta_ptr, int num_combined_tokens,
              std::uintptr_t is_combined_token_in_rank_ptr,
@@ -2304,7 +2318,8 @@ NB_MODULE(ep, m) {
             }
             return self.internode_combine(
                 x_ptr, num_tokens, hidden, x_dtype_code, x_element_size,
-                topk_weights_ptr, num_topk, bias_0_ptr, bias_1_ptr,
+                topk_weights_ptr, num_topk, topk_idx_ptr,
+                origin_topk_weights_ptr, origin_x_ptr, bias_0_ptr, bias_1_ptr,
                 src_meta_ptr, num_combined_tokens,
                 is_combined_token_in_rank_ptr, rdma_channel_prefix_matrix_ptr,
                 rdma_rank_prefix_sum_ptr, gbl_channel_prefix_matrix_ptr,
@@ -2315,6 +2330,8 @@ NB_MODULE(ep, m) {
           nb::arg("x_ptr"), nb::arg("num_tokens"), nb::arg("hidden"),
           nb::arg("x_dtype_code"), nb::arg("x_element_size"),
           nb::arg("topk_weights_ptr"), nb::arg("num_topk"),
+          nb::arg("topk_idx_ptr") = 0, nb::arg("origin_topk_weights_ptr") = 0,
+          nb::arg("origin_x_ptr") = 0,
           nb::arg("bias_0_ptr"), nb::arg("bias_1_ptr"), nb::arg("src_meta_ptr"),
           nb::arg("num_combined_tokens"),
           nb::arg("is_combined_token_in_rank_ptr"),
@@ -2334,6 +2351,7 @@ NB_MODULE(ep, m) {
            nb::arg("x_ptr"), nb::arg("x_dim0"), nb::arg("x_dim1"),
            nb::arg("x_dim2"), nb::arg("topk_idx_ptr"), nb::arg("topk_rows"),
            nb::arg("topk_cols"), nb::arg("topk_weights_ptr"),
+           nb::arg("origin_x_ptr") = 0,
            nb::arg("src_info_ptr"), nb::arg("src_info_dim0"),
            nb::arg("src_info_dim1"), nb::arg("layout_range_ptr"),
            nb::arg("layout_range_dim0"), nb::arg("layout_range_dim1"),

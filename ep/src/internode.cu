@@ -2035,7 +2035,9 @@ __forceinline__ __device__ int combine_token(
     int num_topk, int4* combined_row, float* combined_topk_weights,
     int4 const* bias_0_int4, int4 const* bias_1_int4, int num_max_recv_tokens,
     GetAddrFn const& get_addr_fn, ReceiveTWFn const& recv_tw_fn,
-    uint8_t* smem_ptr, uint32_t (&tma_phase)[kNumStages]) {
+    uint8_t* smem_ptr, uint32_t (&tma_phase)[kNumStages],
+    int64_t const* topk_idx_row = nullptr,
+    float const* topk_weights_row = nullptr, int4* origin_x_row = nullptr) {
   constexpr auto kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
 
   // Broadcast current heads
@@ -2130,6 +2132,17 @@ __forceinline__ __device__ int combine_token(
     // Flush all writes
     tma_store_wait();
   } else {
+    // Zero-computation (identity) experts: sum the router weights of this
+    // token's topk slots whose expert index is -1 (never dispatched). Their
+    // combined contribution is origin_x * this sum, added below. Zero when no
+    // origin_x is supplied (backward compatible).
+    float zero_expert_weight = 0.0f;
+    if (origin_x_row != nullptr) {
+      EP_DEVICE_ASSERT(topk_idx_row != nullptr && topk_weights_row != nullptr);
+#pragma unroll
+      for (int i = 0; i < num_topk; ++i)
+        if (topk_idx_row[i] == -1) zero_expert_weight += topk_weights_row[i];
+    }
 #pragma unroll
     for (int i = lane_id; i < hidden_int4; i += WARP_SIZE) {
       // Read bias
@@ -2176,6 +2189,16 @@ __forceinline__ __device__ int combine_token(
           values[k] += static_cast<float>(recv_value_dtypes[k]);
       }
 
+      // Zero-expert identity contribution for this int4 chunk.
+      if (zero_expert_weight != 0.0f) {
+        auto origin_dtypes =
+            reinterpret_cast<dtype_t const*>(origin_x_row + i);
+#pragma unroll
+        for (int k = 0; k < kDtypePerInt4; ++k)
+          values[k] +=
+              static_cast<float>(origin_dtypes[k]) * zero_expert_weight;
+      }
+
       // Cast back to `dtype_t` and write
       int4 out_int4;
       auto out_dtypes = reinterpret_cast<dtype_t*>(&out_int4);
@@ -2216,7 +2239,9 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
 #endif
     combine(int4* combined_x, float* combined_topk_weights,
             bool const* is_combined_token_in_rank, int4 const* x,
-            float const* topk_weights, int4 const* bias_0, int4 const* bias_1,
+            float const* topk_weights, int64_t const* topk_idx_ori,
+            float const* origin_topk_weights, void* origin_x,
+            int4 const* bias_0, int4 const* bias_1,
             int const* combined_rdma_head, int const* combined_nvl_head,
             SourceMeta const* src_meta, int const* rdma_channel_prefix_matrix,
             int const* rdma_rank_prefix_sum,
@@ -2939,7 +2964,15 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
             bias_0 == nullptr ? nullptr : bias_0 + token_idx * hidden_int4,
             bias_1 == nullptr ? nullptr : bias_1 + token_idx * hidden_int4,
             num_max_rdma_chunked_recv_tokens, get_addr_fn, recv_tw_fn, nullptr,
-            dummy_tma_phases);
+            dummy_tma_phases,
+            topk_idx_ori == nullptr ? nullptr
+                                    : topk_idx_ori + token_idx * num_topk,
+            origin_topk_weights == nullptr
+                ? nullptr
+                : origin_topk_weights + token_idx * num_topk,
+            origin_x == nullptr
+                ? nullptr
+                : reinterpret_cast<int4*>(origin_x) + token_idx * hidden_int4);
       }
 
       // Retired
@@ -3023,7 +3056,9 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
 void combine(cudaDataType_t type, void* combined_x,
              float* combined_topk_weights,
              bool const* is_combined_token_in_rank, void const* x,
-             float const* topk_weights, void const* bias_0, void const* bias_1,
+             float const* topk_weights, int64_t const* topk_idx_ori,
+             float const* origin_topk_weights, void* origin_x,
+             void const* bias_0, void const* bias_1,
              int const* combined_rdma_head, int const* combined_nvl_head,
              void const* src_meta, int const* rdma_channel_prefix_matrix,
              int const* rdma_rank_prefix_sum,
@@ -3063,7 +3098,8 @@ void combine(cudaDataType_t type, void* combined_x,
     LAUNCH_KERNEL(                                                          \
         &cfg, combine_func, reinterpret_cast<int4*>(combined_x),            \
         combined_topk_weights, is_combined_token_in_rank,                   \
-        reinterpret_cast<int4 const*>(x), topk_weights,                     \
+        reinterpret_cast<int4 const*>(x), topk_weights, topk_idx_ori,       \
+        origin_topk_weights, origin_x,                                      \
         reinterpret_cast<int4 const*>(bias_0),                              \
         reinterpret_cast<int4 const*>(bias_1), combined_rdma_head,          \
         combined_nvl_head, reinterpret_cast<SourceMeta const*>(src_meta),   \

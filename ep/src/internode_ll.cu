@@ -745,7 +745,8 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 template <bool kUseLogFMT, int kHidden, int kNumMaxTopk,
           bool kUseAggressiveAtomic>
 __global__ __launch_bounds__(1024, 1) void combine(
-    void* combined_x, void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
+    void* combined_x, void* origin_x, void* rdma_recv_x, int* rdma_recv_flag,
+    void* rdma_send_x,
     void const* x, int64_t const* topk_idx, float const* topk_weights,
     int const* src_info, int64_t const* layout_range,
     int64_t* combine_wait_recv_cost_stats, int* next_clean,
@@ -1179,6 +1180,11 @@ LOW_LATENCY_COMBINE_RECV:
       }
 
       float combined_values[kNumElemsPerInt4] = {0.0f};
+      // Zero-computation (identity) experts: their topk_idx slot is -1 and they
+      // were never dispatched, so no rdma_recv_x row exists. Their contribution
+      // is the original (pre-dispatch) hidden scaled by the router weight. Sum
+      // all such weights here and add a single origin_x term after the reduce.
+      float zero_expert_weight = 0.0f;
 #pragma unroll
       for (int i = 0; i < num_topk; ++i)
         if (reg_topk_idx[i] >= 0) {
@@ -1198,7 +1204,24 @@ LOW_LATENCY_COMBINE_RECV:
           for (int j = 0; j < kNumElemsPerInt4; ++j)
             combined_values[j] +=
                 static_cast<float>(x_bf16[j]) * reg_topk_weights[i];
+        } else {
+          zero_expert_weight += reg_topk_weights[i];
         }
+
+      // Zero-expert identity contribution (origin_x is [num_combined_tokens,
+      // hidden] bf16; stride kHidden matches num_bytes_per_slot). No-op when the
+      // caller passes no origin_x (nullptr) or no token selected a zero-expert.
+      if (origin_x != nullptr && zero_expert_weight != 0.0f) {
+        auto origin_row = reinterpret_cast<int4 const*>(
+            static_cast<uint8_t const*>(origin_x) +
+            token_idx * kHidden * sizeof(nv_bfloat16));
+        auto x_vec = ld_nc_global(origin_row + hidden_idx);
+        auto const x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
+#pragma unroll
+        for (int j = 0; j < kNumElemsPerInt4; ++j)
+          combined_values[j] +=
+              static_cast<float>(x_bf16[j]) * zero_expert_weight;
+      }
 
       // Write results
       int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
@@ -1215,8 +1238,9 @@ LOW_LATENCY_COMBINE_RECV:
   }
 }
 
-void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
-             void* rdma_send_x, void const* x, int64_t const* topk_idx,
+void combine(void* combined_x, void* origin_x, void* rdma_recv_x,
+             int* rdma_recv_flag, void* rdma_send_x, void const* x,
+             int64_t const* topk_idx,
              float const* topk_weights, int const* src_info,
              int64_t const* layout_range, int64_t* combine_wait_recv_cost_stats,
              int* next_clean, int64_t* next_clean_second,
@@ -1289,8 +1313,9 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
                           : combine<false, hidden, kNumMaxTopk, false>);     \
     SET_SHARED_MEMORY_FOR_TMA(combine_func);                                 \
     LAUNCH_KERNEL(                                                           \
-        &cfg, combine_func, combined_x, rdma_recv_x, rdma_recv_flag,         \
-        rdma_send_x, x, topk_idx, topk_weights, src_info, layout_range,      \
+        &cfg, combine_func, combined_x, origin_x, rdma_recv_x,               \
+        rdma_recv_flag, rdma_send_x, x, topk_idx, topk_weights, src_info,     \
+        layout_range,                                                         \
         combine_wait_recv_cost_stats, next_clean, next_clean_second,         \
         num_next_clean_int, atomic_clean_flag, num_combined_tokens, hidden,  \
         num_topk, num_max_dispatch_tokens_per_rank, num_experts, rank,       \

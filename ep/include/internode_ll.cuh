@@ -30,8 +30,9 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               void* atomic_buffer_ptr = nullptr,
               int64_t* rdma_recv_count_internode = nullptr);
 
-void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
-             void* rdma_send_x, void const* x, int64_t const* topk_idx,
+void combine(void* combined_x, void* origin_x, void* rdma_recv_x,
+             int* rdma_recv_flag, void* rdma_send_x, void const* x,
+             int64_t const* topk_idx,
              float const* topk_weights, int const* src_info,
              int64_t const* layout_range, int64_t* combine_wait_recv_cost_stats,
              int* next_clean, int64_t* next_clean_second,

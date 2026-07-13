@@ -463,6 +463,11 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
         combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
+        # Zero-computation (identity) expert support: original pre-dispatch
+        # hidden `[num_combined_tokens, hidden]` bf16. Tokens whose topk_idx is
+        # -1 (routed to a zero-expert) get origin_x * summed_weight added back in
+        # combine. None => no zero-expert contribution (DeepEP-compatible default).
+        origin_x: Optional[torch.Tensor] = None,
         # DeepEP-compatible overlap kwargs (accepted but not yet implemented).
         # Present so SGLang SBO callers (deepep.py:680-693 on both Hopper and
         # Blackwell paths) can pass them without TypeError. Enabling overlap
@@ -559,6 +564,7 @@ class Buffer:
             topk_idx.size(0),
             topk_idx.size(1),
             topk_weights.data_ptr(),
+            (0 if origin_x is None else origin_x.data_ptr()),
             src_info.data_ptr(),
             src_info.size(0),
             src_info.size(1),
@@ -1256,6 +1262,9 @@ class Buffer:
         x: torch.Tensor,
         handle: Tuple,
         topk_weights: Optional[torch.Tensor] = None,
+        topk_idx: Optional[torch.Tensor] = None,
+        origin_topk_weights: Optional[torch.Tensor] = None,
+        origin_x: Optional[torch.Tensor] = None,
         bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
         config: Optional[Config] = None,
         previous_event: Optional[EventOverlap] = None,
@@ -1295,6 +1304,9 @@ class Buffer:
                 x,
                 handle,
                 topk_weights,
+                topk_idx,
+                origin_topk_weights,
+                origin_x,
                 bias,
                 config,
                 previous_event,
@@ -1773,6 +1785,9 @@ class Buffer:
         x: torch.Tensor,
         handle: Union[tuple, list],
         topk_weights: Optional[torch.Tensor] = None,
+        topk_idx: Optional[torch.Tensor] = None,
+        origin_topk_weights: Optional[torch.Tensor] = None,
+        origin_x: Optional[torch.Tensor] = None,
         bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
         config: Optional[Config] = None,
         previous_event: Optional[EventOverlap] = None,
@@ -1840,6 +1855,9 @@ class Buffer:
             x.element_size(),
             0 if topk_weights is None else topk_weights.data_ptr(),
             num_topk,
+            0 if topk_idx is None else topk_idx.data_ptr(),
+            0 if origin_topk_weights is None else origin_topk_weights.data_ptr(),
+            0 if origin_x is None else origin_x.data_ptr(),
             0 if bias_0 is None else bias_0.data_ptr(),
             0 if bias_1 is None else bias_1.data_ptr(),
             src_meta.data_ptr(),
